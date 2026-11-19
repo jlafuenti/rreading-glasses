@@ -36,6 +36,18 @@ type server struct {
 
 	HardcoverAuth     string `required:"" env:"HARDCOVER_AUTH" xor:"hardcover-auth" help:"Hardcover Authorization header, e.g. 'Bearer ...'"`
 	HardcoverAuthFile []byte `required:"" type:"filecontent" xor:"hardcover-auth" env:"HARDCOVER_AUTH_FILE" help:"File containing the Hardcover Authorization header, e.g. 'Bearer ...'"`
+
+	// Hardcover rejects requests with more than 10 top-level queries
+	// ("request_exceeds_capacity"), which drops every query in the batch.
+	HardcoverBatchSize int `default:"10" env:"HARDCOVER_BATCH_SIZE" help:"Maximum number of queries batched into one Hardcover request."`
+}
+
+// Validate rejects settings the server can't run with.
+func (s *server) Validate() error {
+	if s.HardcoverBatchSize < 1 {
+		return fmt.Errorf("--hardcover-batch-size must be at least 1, got %d", s.HardcoverBatchSize)
+	}
+	return nil
 }
 
 func (s *server) Run() error {
@@ -68,7 +80,7 @@ func (s *server) Run() error {
 
 	hcClient := &http.Client{Transport: hcTransport}
 
-	gql, err := internal.NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, time.Second, 25 /* Not sure about this */, reg)
+	gql, err := internal.NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, time.Second, s.HardcoverBatchSize, reg)
 	if err != nil {
 		return err
 	}
