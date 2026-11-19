@@ -34,6 +34,11 @@ type batchedgqlclient struct {
 	every     time.Duration  // every controls how often requests are flushed.
 	metrics   *gqlMetrics    // metrics tracks batches and queries sent.
 
+	retryBase  time.Duration // retryBase is the pause after a first rate-limited (429) batch; it doubles on each retry.
+	maxRetries int           // maxRetries is how many times a rate-limited batch is resent before its queries fail.
+
+	pausedUntil time.Time // pausedUntil holds off all flushes after a 429 so the upstream rate limit can recover.
+
 	wrapped graphql.Client
 }
 
@@ -48,6 +53,9 @@ func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duratio
 		queue:     []batchedQuery{},
 		metrics:   newGQLMetrics(reg),
 		every:     every,
+
+		retryBase:  5 * time.Second,
+		maxRetries: 4,
 	}
 
 	go func() {
@@ -93,6 +101,10 @@ func (c *batchedgqlclient) flush(ctx context.Context) {
 		return // Nothing to do yet.
 	}
 
+	if time.Now().Before(c.pausedUntil) {
+		return // Backing off after a 429.
+	}
+
 	// Take our oldest batch off the queue.
 	batch := c.queue[0]
 	c.queue = c.queue[1:]
@@ -123,6 +135,12 @@ func (c *batchedgqlclient) flush(ctx context.Context) {
 		defer cancel()
 
 		err := c.wrapped.MakeRequest(ctx, req, resp)
+
+		// A 429 fails the whole batch, so put it back at the front of the
+		// queue and pause flushing instead of failing every query in it.
+		if isRateLimited(err) && c.retry(ctx, batch) {
+			return
+		}
 
 		// Extract any field-level errors, and return them to their
 		// subscribers. We can ignore the top-level err in this case, because
@@ -253,6 +271,38 @@ type queryBuilder struct {
 type batchedQuery struct {
 	qb          *queryBuilder
 	subscribers map[string]*subscription
+	attempts    int // attempts counts how many times this batch was resent after a 429.
+}
+
+// isRateLimited reports whether err is an upstream 429.
+func isRateLimited(err error) bool {
+	var httpErr *graphql.HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusTooManyRequests
+	}
+	return errors.Is(err, statusErr(http.StatusTooManyRequests))
+}
+
+// retry requeues a rate-limited batch at the front of the queue and pauses
+// flushing, doubling the pause on each attempt. It returns false once the
+// batch has used up its retries, leaving the caller to fail its queries.
+func (c *batchedgqlclient) retry(ctx context.Context, batch batchedQuery) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if batch.attempts >= c.maxRetries {
+		return false
+	}
+
+	delay := c.retryBase << batch.attempts
+	batch.attempts++
+	if until := time.Now().Add(delay); until.After(c.pausedUntil) {
+		c.pausedUntil = until
+	}
+	c.queue = append([]batchedQuery{batch}, c.queue...)
+
+	Log(ctx).Warn("rate limited, retrying batch", "count", len(batch.subscribers), "attempt", batch.attempts, "delay", delay)
+	return true
 }
 
 // _fragments holds string representations of fragment nodes since they are static.
